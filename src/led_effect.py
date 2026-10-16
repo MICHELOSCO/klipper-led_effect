@@ -6,6 +6,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
+import logging
 from math import cos, exp, pi
 from random import randint
 
@@ -99,6 +100,31 @@ class ledFrameHandler:
         if helper is None:
             raise RuntimeError("Klipper version not compatible: chain has no 'led_helper'.")
 
+        # Newer Klipper: _check_transmit() queues one reactor callback per
+        # call and each one waits for an MCU ack. At 24fps they pile up when
+        # the bus is slow, and the reactor caches every greenlet it created,
+        # so RAM only grows. Keep at most one send in flight per chain and
+        # coalesce the frames produced meanwhile into the next send.
+        if hasattr(helper, 'update_func') and hasattr(helper, 'mutex'):
+            if chain in self._inflight:
+                self._dirty.add(chain)
+                return
+            self._inflight.add(chain)
+            def send(eventtime):
+                try:
+                    while not self.shutdown:
+                        self._dirty.discard(chain)
+                        with helper.mutex:
+                            helper.update_func(list(helper.led_state), None)
+                        if chain not in self._dirty:
+                            break
+                except self.printer.command_error:
+                    logging.exception("led_effect transmit error")
+                finally:
+                    self._inflight.discard(chain)
+            self.reactor.register_callback(send)
+            return
+
         # Request a transmit
         helper.need_transmit = True
 
@@ -114,6 +140,8 @@ class ledFrameHandler:
     def _handle_ready(self):
         self.shutdown = False
         self.reactor = self.printer.get_reactor()
+        self._inflight = set()
+        self._dirty = set()
         self.printer.register_event_handler('klippy:shutdown', 
                                             self._handle_shutdown)
         self.printProgress = 0
